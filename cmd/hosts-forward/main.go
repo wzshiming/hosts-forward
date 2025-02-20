@@ -23,62 +23,106 @@ var (
 )
 
 func init() {
-	pflag.StringVar(&defaultEndpoint, "default-endpoint", defaultEndpoint, "default endpoint")
-	pflag.StringToStringVar(&endpoints, "endpoint", endpoints, "endpoint")
-	pflag.StringVar(&blockEndpoint, "block-endpoint", blockEndpoint, "block endpoint")
+	pflag.StringVar(&defaultEndpoint, "default-endpoint", defaultEndpoint, "Default endpoint for forwarding")
+	pflag.StringToStringVar(&endpoints, "endpoint", endpoints, "Host-specific endpoints mapping")
+	pflag.StringVar(&blockEndpoint, "block-endpoint", blockEndpoint, "Endpoint to block requests for")
 	pflag.Parse()
 }
 
 func main() {
 	ctx := context.Background()
 
+	// Start TLS listener
 	listener, err := net.Listen("tcp", ":443")
 	if err != nil {
-		slog.Error("Failed to listen port", "err", err)
+		slog.Error("Failed to listen on port 443", "err", err)
 		os.Exit(1)
 	}
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				slog.Error("Failed to accept conn", "err", err)
-				os.Exit(1)
-			}
-			var dialer net.Dialer
-			slog.Info("come conn", "from", splitHost(conn.RemoteAddr().String()))
-			go forward(ctx, &dialer, conn)
-		}
-	}()
+	// Start HTTP->HTTPS redirector
+	go startRedirector()
 
-	http.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.URL.Scheme = "https"
-		if r.URL.Host == "" {
-			r.URL.Host = r.Host
-		}
-		http.Redirect(w, r, r.URL.String(), http.StatusFound)
-	}))
+	// Handle incoming TLS connections
+	go startListener(ctx, listener)
 
-	err = http.ListenAndServe(":80", nil)
-	if err != nil {
-		slog.Error("Failed to start http", "err", err)
+	// Block main goroutine
+	select {}
+}
+
+func startListener(ctx context.Context, listener net.Listener) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			slog.Error("Connection accept failed", "err", err)
+			os.Exit(1)
+		}
+
+		from := splitHost(conn.RemoteAddr().String())
+		slog.Info("New connection", "from", from)
+		go handleConnection(ctx, conn, from)
+	}
+}
+
+func startRedirector() {
+	http.Handle("/", http.HandlerFunc(redirectToHTTPS))
+
+	if err := http.ListenAndServe(":80", nil); err != nil {
+		slog.Error("HTTP server failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func forward(ctx context.Context, dialer *net.Dialer, conn net.Conn) {
-	buf := bytes.NewBuffer(nil)
+func redirectToHTTPS(w http.ResponseWriter, r *http.Request) {
+	r.URL.Scheme = "https"
+	if r.URL.Host == "" {
+		r.URL.Host = r.Host
+	}
+	http.Redirect(w, r, r.URL.String(), http.StatusFound)
+}
+
+func handleConnection(ctx context.Context, conn net.Conn, from string) {
 	defer conn.Close()
 
-	from := splitHost(conn.RemoteAddr().String())
-
-	tmpReader := io.TeeReader(conn, buf)
-	host, err := sni.TLSHost(tmpReader)
+	// Read SNI host from connection
+	buf := bytes.NewBuffer(nil)
+	host, err := sni.TLSHost(io.TeeReader(conn, buf))
 	if err != nil {
-		slog.Warn("failed to get host", "from", from, "err", err)
+		slog.Warn("Failed to parse SNI", "from", from, "err", err)
 		return
 	}
 
+	// Determine target address
+	targetAddr, err := determineTargetAddress(host, from)
+	if err != nil {
+		slog.Warn("Failed to resolve target", "host", host, "from", from, "err", err)
+		return
+	}
+
+	// Handle blocking
+	if targetAddr == blockEndpoint {
+		slog.Info("Blocked connection", "host", host, "from", from)
+		return
+	}
+
+	// Establish forward connection
+	forwardConn, err := net.Dial("tcp", net.JoinHostPort(targetAddr, "443"))
+	if err != nil {
+		slog.Warn("Failed to connect to target", "target", targetAddr, "host", host, "from", from, "err", err)
+		return
+	}
+	defer forwardConn.Close()
+
+	// Start proxying
+	slog.Info("Forwarding connection", "target", targetAddr, "host", host, "from", from)
+	if err := tunnel(ctx, cmux.UnreadConn(conn, buf.Bytes()), forwardConn); err != nil {
+		slog.Warn("Forwarding error", "target", targetAddr, "host", host, "from", from, "err", err)
+		return
+	}
+	slog.Info("Connection completed", "target", targetAddr, "host", host, "from", from)
+}
+
+func determineTargetAddress(host, from string) (string, error) {
+	// Check endpoint mappings
 	address := defaultEndpoint
 	if e, ok := endpoints[host]; ok {
 		address = e
@@ -87,55 +131,15 @@ func forward(ctx context.Context, dialer *net.Dialer, conn net.Conn) {
 		address = host
 	}
 
-	if e, err := getHostAddress(address); err != nil {
-		slog.Warn("failed to get address", "target", address, "from", from, "host", host, "err", err)
-		return
-	} else {
-		address = e
-	}
-
-	if address == blockEndpoint {
-		slog.Info("block", "target", address, "from", from, "host", host)
-		return
-	}
-
-	slog.Info("forward", "target", address, "from", from)
-	forward, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, "443"))
+	// Resolve actual IP address
+	resolvedAddr, err := getHostAddress(address)
 	if err != nil {
-		slog.Warn("failed to dial target", "target", address, "from", from, "host", host, "err", err)
-		return
+		return "", err
 	}
-	defer forward.Close()
-
-	err = tunnel(ctx, cmux.UnreadConn(conn, buf.Bytes()), forward)
-	if err != nil {
-		slog.Warn("end forwarding", "target", address, "from", from, "host", host, "err", err)
-		return
-	}
-	slog.Info("done", "target", address, "from", from, "host", host)
+	return resolvedAddr, nil
 }
 
-func tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser) error {
-	ctx, cancel := context.WithCancel(ctx)
-	var errs tunnelErr
-	go func() {
-		_, errs[0] = io.Copy(c1, c2)
-		cancel()
-	}()
-	go func() {
-		_, errs[1] = io.Copy(c2, c1)
-		cancel()
-	}()
-	<-ctx.Done()
-	errs[2] = c1.Close()
-	errs[3] = c2.Close()
-	errs[4] = ctx.Err()
-	if errs[4] == context.Canceled {
-		errs[4] = nil
-	}
-	return errs.FirstError()
-}
-
+// Connection tunneling logic
 type tunnelErr [5]error
 
 func (t tunnelErr) FirstError() error {
@@ -147,29 +151,62 @@ func (t tunnelErr) FirstError() error {
 	return nil
 }
 
-func splitHost(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
+func tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var errs tunnelErr
+
+	go func() {
+		_, errs[0] = io.Copy(c1, c2)
+		cancel()
+	}()
+
+	go func() {
+		_, errs[1] = io.Copy(c2, c1)
+		cancel()
+	}()
+
+	<-ctx.Done()
+
+	errs[2] = c1.Close()
+	errs[3] = c2.Close()
+	errs[4] = ctx.Err()
+	if errs[4] == context.Canceled {
+		errs[4] = nil
 	}
-	return host
+
+	return errs.FirstError()
 }
 
-var cacheAddr sync.Map
+// DNS resolution with caching
+var ipCache sync.Map
 
 func getHostAddress(host string) (string, error) {
 	host = splitHost(host)
 
-	names, err := net.LookupIP(host)
+	ips, err := net.LookupIP(host)
 	if err != nil {
-		a, ok := cacheAddr.Load(host)
+		cached, ok := ipCache.Load(host)
 		if !ok {
 			return "", err
 		}
-		names = a.([]net.IP)
+		ips = cached.([]net.IP)
 	} else {
-		cacheAddr.Store(host, names)
-		slog.Info("lookup", "names", names)
+		ipCache.Store(host, ips)
+		slog.Debug("DNS lookup", "host", host, "ips", ips)
+	}
+	if len(ips) == 1 {
+		return ips[0].String(), nil
 	}
 
-	return names[rand.Int63n(int64(len(names)))].String(), nil
+	return ips[rand.Int63n(int64(len(ips)))].String(), nil
+}
+
+// Helper functions
+func splitHost(hostPort string) string {
+	if host, _, err := net.SplitHostPort(hostPort); err == nil {
+		return host
+	}
+	return hostPort
 }
