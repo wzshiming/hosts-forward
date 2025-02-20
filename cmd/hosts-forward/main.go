@@ -5,9 +5,11 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"sync"
 
 	"github.com/spf13/pflag"
 	"github.com/wzshiming/cmux"
@@ -17,11 +19,13 @@ import (
 var (
 	defaultEndpoint string
 	endpoints       map[string]string
+	blockEndpoint   string
 )
 
 func init() {
 	pflag.StringVar(&defaultEndpoint, "default-endpoint", defaultEndpoint, "default endpoint")
 	pflag.StringToStringVar(&endpoints, "endpoint", endpoints, "endpoint")
+	pflag.StringVar(&blockEndpoint, "block-endpoint", blockEndpoint, "block endpoint")
 	pflag.Parse()
 }
 
@@ -83,8 +87,19 @@ func forward(ctx context.Context, dialer *net.Dialer, conn net.Conn) {
 		address = host
 	}
 
-	slog.Info("forward", "target", address, "from", from)
+	if e, err := getHostAddress(address); err != nil {
+		slog.Warn("failed to get address", "target", address, "from", from, "host", host, "err", err)
+		return
+	} else {
+		address = e
+	}
 
+	if address == blockEndpoint {
+		slog.Info("block", "target", address, "from", from, "host", host)
+		return
+	}
+
+	slog.Info("forward", "target", address, "from", from)
 	forward, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, "443"))
 	if err != nil {
 		slog.Warn("failed to dial target", "target", address, "from", from, "host", host, "err", err)
@@ -137,4 +152,24 @@ func splitHost(host string) string {
 		return h
 	}
 	return host
+}
+
+var cacheAddr sync.Map
+
+func getHostAddress(host string) (string, error) {
+	host = splitHost(host)
+
+	names, err := net.LookupIP(host)
+	if err != nil {
+		a, ok := cacheAddr.Load(host)
+		if !ok {
+			return "", err
+		}
+		names = a.([]net.IP)
+	} else {
+		cacheAddr.Store(host, names)
+		slog.Info("lookup", "names", names)
+	}
+
+	return names[rand.Int63n(int64(len(names)))].String(), nil
 }
