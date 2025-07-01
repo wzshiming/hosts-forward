@@ -90,6 +90,7 @@ func handleConnection(ctx context.Context, conn net.Conn, from string) {
 	defer func() {
 		buf.Reset()
 		bufferPool.Put(buf)
+		conn.Close()
 	}()
 
 	host, err := sni.TLSHost(io.TeeReader(conn, buf))
@@ -104,17 +105,16 @@ func handleConnection(ctx context.Context, conn net.Conn, from string) {
 
 	targetAddr, err := determineTargetAddress(host, from)
 	if err != nil {
-		conn.Close()
 		slog.Warn("Target resolution failed", "host", host, "from", from, "err", err)
 		return
 	}
 
 	forwardConn, err := net.Dial("tcp", net.JoinHostPort(targetAddr, "443"))
 	if err != nil {
-		conn.Close()
 		slog.Warn("Target connection failed", "target", targetAddr, "host", host, "from", from, "err", err)
 		return
 	}
+	defer forwardConn.Close()
 
 	slog.Info("Starting proxy tunnel", "target", targetAddr, "host", host, "from", from)
 	if err := tunnel(ctx, cmux.UnreadConn(conn, buf.Bytes()), forwardConn); err != nil {
@@ -172,14 +172,13 @@ func drainCh(ch chan error) {
 	}
 }
 
-func tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser) error {
+func tunnel(ctx context.Context, c1, c2 io.ReadWriter) error {
 	buf1 := bytesPool.Get().([]byte)
 	buf2 := bytesPool.Get().([]byte)
 	errCh := errChPool.Get().(chan error)
-	defer func() {
-		c1.Close()
-		c2.Close()
+	drainCh(errCh)
 
+	defer func() {
 		bytesPool.Put(buf1)
 		bytesPool.Put(buf2)
 
