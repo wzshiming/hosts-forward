@@ -109,6 +109,15 @@ func handleConnection(ctx context.Context, conn net.Conn, from string) {
 		return
 	}
 
+	if targetAddr == from {
+		if sniFallbackEndpoint == "" {
+			conn.Close()
+			slog.Warn("Target address same as source", "host", host, "from", from)
+			return
+		}
+		host = sniFallbackEndpoint
+	}
+
 	forwardConn, err := net.Dial("tcp", net.JoinHostPort(targetAddr, "443"))
 	if err != nil {
 		slog.Warn("Target connection failed", "target", targetAddr, "host", host, "from", from, "err", err)
